@@ -1,8 +1,8 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from Basilisk.utilities import SimulationBaseClass, macros, simIncludeGravBody, orbitalMotion
-from Basilisk.simulation import spacecraft
-
+from Basilisk.simulation import spacecraft, extForceTorque
+from RelOrbitMaintenance import RelOrbitMaintenance
 from Basilisk.utilities.supportDataTools.dataFetcher import get_path, DataFile
 
 # ---------------- target orbit (LEO, circular) ----------------
@@ -11,8 +11,8 @@ ALT   = 500e3
 A_T   = R_E + ALT
 I_T   = np.deg2rad(97.4)
 OMEGA_T, U_T = 0.0, 0.0        # RAAN and mean arg. of latitude at t=0 (e=0, so omega_t=0, f_t=u_t)
-DT    = 10.0                   # s
-
+DT    = 1.0                    # s
+M = 1000                       #kg, both s/c mass
 
 # ---------------- ROE -> chaser classical elements ----------------
 def roe_to_chaser_elements(roe):
@@ -59,36 +59,63 @@ def propagate(roe, hours):
     earth.isCentralBody = True
 
 
-    USE_J2 = False   # or make this a parameter of propagate()
+    USE_J2 = True   # or make this a parameter of propagate()
     if USE_J2:
-        earth.useSphericalHarmParams = True
-        simIncludeGravBody.loadGravFromFile(
-            get_path(DataFile.LocalGravData.GGM03S_J2_only),
-            earth.spherHarm,
-            2,
-        )
+        #i think there's a version difference that removed the first of the below ways to do this
+        try:
+            earth.useSphericalHarmParams = True
+            simIncludeGravBody.loadGravFromFile(
+                get_path(DataFile.LocalGravData.GGM03S_J2_only),
+                earth.spherHarm,
+                2,
+            )
+        except:
+            earth.useSphericalHarmonicsGravityModel(
+                str(get_path(DataFile.LocalGravData.GGM03S_J2_only)), 2
+                )
 
     mu = earth.mu
 
-    def make_sc(name, oe):
+    oe_t = orbitalMotion.ClassicElements()
+    oe_t.a, oe_t.e, oe_t.i = A_T, 0.0, I_T
+    oe_t.Omega, oe_t.omega, oe_t.f = OMEGA_T, 0.0, U_T
+
+    def make_sc(name, oe, other_sc=None):
         sc = spacecraft.Spacecraft()
         sc.ModelTag = name
         sc.gravField.gravBodies = spacecraft.GravBodyVector(list(grav.gravBodies.values()))
         rN, vN = orbitalMotion.elem2rv(mu, oe)
         sc.hub.r_CN_NInit = rN
         sc.hub.v_CN_NInit = vN
-        sim.AddModelToTask("task", sc)
+        sc.hub.mHub = M
+        sim.AddModelToTask("task", sc, 1)
         rec = sc.scStateOutMsg.recorder()
         sim.AddModelToTask("task", rec)
-        return rec
+        if name == "chaser": #integrate control algorithm to chaser
+            #note that this does not yet deal with a guidance algorithm, but i think
+            #that can be rather simply implemented as a class by having the guidance 
+            #algorithm output a message of type THRArrayCmdForceMsg and subscribing the
+            #optimal control algorithm to it so it can capture changing desired ROE settings. 
+            #that also requires setting guidance=true in the constructor initialization
+            
+            #initialize the optimal control algorithm
+            optimal = RelOrbitMaintenance([oe_t.a, oe_t.e, oe_t.i, oe_t.f], M, DT, roe_des=roe)
+            sim.AddModelToTask("task", optimal)
+            optimal.chiefTransInMsg.subscribeTo(other_sc.scStateOutMsg) #chief state
+            optimal.chaserTransInMsg.subscribeTo(sc.scStateOutMsg) #chaser state
 
-    oe_t = orbitalMotion.ClassicElements()
-    oe_t.a, oe_t.e, oe_t.i = A_T, 0.0, I_T
-    oe_t.Omega, oe_t.omega, oe_t.f = OMEGA_T, 0.0, U_T
+            #extforcetorque module to actually apply the desired forces
+            control = extForceTorque.ExtForceTorque()
+            sc.addDynamicEffector(control)
+            sim.AddModelToTask("task", control)
+            control.cmdForceInertialInMsg.subscribeTo(optimal.cmdForceOutMsg) #input from controller
 
-    rec_t = make_sc("target", oe_t)
-    rec_c = make_sc("chaser", roe_to_chaser_elements(roe))
+        return rec, sc
 
+    rec_t, target = make_sc("target", oe_t)
+    rec_c, chaser = make_sc("chaser", roe_to_chaser_elements(roe / 2), target)
+    
+    sim.SetProgressBar(True)
     sim.InitializeSimulation()
     sim.ConfigureStopTime(macros.hour2nano(hours))
     sim.ExecuteSimulation()
@@ -115,7 +142,7 @@ def period_hr():
 
 # ---------------- Case 1: baseline in-plane NMC ----------------
 def case_baseline():
-    t, rel = propagate(make_roe(A=10e3), hours=6.0)
+    t, rel = propagate(make_roe(A=10e3), hours=60.0)
     km = rel / 1e3
     print("\n[baseline] period = %.2f min" % (period_hr() * 60))
     print("  radial   min/max (km):", km[:, 0].min(), km[:, 0].max(), " (expect +-10)")
